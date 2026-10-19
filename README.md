@@ -23,7 +23,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the full list, and [THIRD-PARTY-NOTICES.txt
 2. Copy `GTACoOp.dll` and its dependency DLLs (LemonUI.SHVDN3, Lidgren.Network.MultiTarget, MaxMind.Db, MaxMind.GeoIP2, Newtonsoft.Json, protobuf-net) into your GTA V `scripts` folder.
 3. Start the game and open the GTA Coop menu.
 
-The GeoLite2 database (`GeoLite2.mmdb`) is optional and isn't included. It only adds country tags like `[NA/US]` in the server browser. If the file isn't there, the client just skips the country tag (no errors). To get the tags, download GeoLite2-Country (or GeoLite2-City) from [MaxMind](https://www.maxmind.com/en/geolite2/signup) under their license, rename it `GeoLite2.mmdb` and put it in your GTA V `scripts` folder next to `GTACoOp.dll`.
+The GeoLite2 database (`GeoLite2.mmdb`) is optional and isn't included. It only adds country tags like `[NA/US]` in the server browser. If the file isn't there, the client just skips the country tag (no errors). To get the tags, download GeoLite2-Country (or GeoLite2-City) from [MaxMind](https://www.maxmind.com/en/geolite2/signup) under their license, rename it `GeoLite2.mmdb` and put it in your GTA V `scripts` folder next to `GTACoOp.dll`. Or just grab the `GeoLite2.mmdb` that comes in oldnapalm's [GTA Coop client v0.9.4.7 zip](https://github.com/oldnapalm/GTACoop/releases/tag/v0.9.4.7) (it's an older 2023 copy, but it works).
 
 ## Build
 
