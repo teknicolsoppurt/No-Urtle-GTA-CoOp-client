@@ -10,5 +10,6 @@ Modified from [oldnapalm/GTACoop](https://github.com/oldnapalm/GTACoop), client 
 - Added a **Chat Filter** setting for comma-separated words. Lines containing them are hidden, and they're also left out of the chat log. Matching ignores case, spaces, punctuation, GTA color codes, accents, and common look-alike characters. The filter never hides your own messages.
 - Added a **Crash Log** option (off by default) that writes errors to `GTACoOp-crash.log` in the scripts folder. Errors in incoming packets are caught and logged instead of crashing the client, with a throttled in-game notice.
 - Fixed NullReferenceExceptions from missing vehicle and ped position data, ped props, the server game mode, and the server hail message.
+- The server browser no longer shows GeoIP2 errors when `GeoLite2.mmdb` is missing. It just skips the country tags.
 - Added TekNicolSoppurt to the credits.
 - Display version 0.9.5 and assembly version 0.9.5.0. The network protocol version is still 0.9.4 for server compatibility.

@@ -1736,6 +1736,8 @@ namespace GTACoOp
                     var database = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "GeoLite2.mmdb");
                     string description = msg.SenderEndPoint.Address.ToString() + ":" + data.Port;
 
+                    // Country tags are optional: skip the lookup quietly if GeoLite2.mmdb isn't there.
+                    if (File.Exists(database))
                     try
                     {
                         using (var reader = new DatabaseReader(database))
