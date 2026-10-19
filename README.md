@@ -2,7 +2,7 @@
 
 A modified client for [GTA Coop](https://github.com/oldnapalm/GTACoop), the multiplayer modification for Grand Theft Auto V that uses none of Rockstar's online code.
 
-This repo contains **only the client** (`GTACoOp.dll`). It's built to work with the existing GTA Coop servers from [oldnapalm/GTACoop](https://github.com/oldnapalm/GTACoop). It still reports network version 0.9.4, so it can join the same servers.
+This repo contains **only the client** (`GTACoOp.dll`). It's built to work with the existing GTA Coop servers from [oldnapalm/GTACoop](https://github.com/oldnapalm/GTACoop). It still reports network version 0.9.4, so it can join the same servers. It's based on the standard client, not the voice chat version, so it doesn't include voice chat.
 
 ## Main features
 
