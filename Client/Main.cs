@@ -79,6 +79,15 @@ namespace GTACoOp
         private Dictionary<string, NativeData> _dcNatives;
         private List<int> _entityCleanup;
         private List<int> _blipCleanup;
+        // Other things a server can create through natives, removed when you leave the server
+        private readonly List<int> _checkpointCleanup = new List<int>();
+        private readonly List<int> _pickupCleanup = new List<int>();
+        private readonly List<int> _camCleanup = new List<int>();
+        // Screen/HUD/GPS changing natives the current server has called, so they can be undone when you leave
+        private readonly HashSet<ulong> _serverStateNatives = new HashSet<ulong>();
+        private GTA.Math.Vector2? _serverWaypoint;
+        // Per-tick natives that must only run once per server update (screen effects, creators), keyed by tick identifier
+        private readonly Dictionary<string, NativeData> _tickOnceDone = new Dictionary<string, NativeData>();
 
         private static Dictionary<int, int> _vehMods = new Dictionary<int, int>();
         private static Dictionary<int, int> _pedClothes = new Dictionary<int, int>();
@@ -974,7 +983,9 @@ namespace GTACoOp
                     Function.Call((Hash)0x2F9A292AD0A3BD89);
                     Function.Call((Hash)0x5F3B7749C112D552);
                 }
-                Function.Call(Hash.SET_TIME_SCALE, 1f);
+                // Keep normal speed, unless the server set its own time scale (then don't fight it every frame)
+                if (!_serverStateNatives.Contains((ulong)Hash.SET_TIME_SCALE))
+                    Function.Call(Hash.SET_TIME_SCALE, 1f);
 
                 /*string stats = string.Format("{0}Kb (D)/{1}Kb (U), {2}Msg (D)/{3}Msg (U)", _bytesReceived / 1000,
                     _bytesSent / 1000, _messagesReceived, _messagesSent);
@@ -1001,11 +1012,16 @@ namespace GTACoOp
                 Dictionary<string, NativeData> tickNatives = null;
                 lock (_tickNatives) tickNatives = new Dictionary<string, NativeData>(_tickNatives);
 
-                for (int i = 0; i < tickNatives.Count; i++) DecodeNativeCall(tickNatives.ElementAt(i).Value);
+                // Each tick native runs on its own, so one bad native can't stop the others (or the rest of the frame)
+                foreach (var pair in tickNatives)
+                {
+                    try { RunTickNative(pair.Key, pair.Value); }
+                    catch (Exception ex) { ShowErrorNotice("NativeTick", ex); }
+                }
             }catch(Exception ex)
             {
-                Notification.Show("<ERROR> Could not handle this tick: " + ex.ToString());
-                _logger.WriteException("Could not handle tick", ex);
+                // Throttled: this used to post a full stack trace notification every single frame
+                ShowErrorNotice("Tick", ex);
             }
         }
 		
@@ -1107,6 +1123,12 @@ namespace GTACoOp
                 DebugLogger.NetClient = _client;
             }
 
+            // Remove anything left over from the last server before starting a new connection
+            SafeStep("Connect", WorldCleanUp);
+            SafeStep("Connect", RestoreServerState);
+            lock (_dcNatives) _dcNatives.Clear();
+            _tickOnceDone.Clear();
+
             lock (Opponents) Opponents = new Dictionary<long, SyncPed>();
             lock (Npcs) Npcs = new Dictionary<string, SyncPed>();
             lock (_tickNatives) _tickNatives = new Dictionary<string, NativeData>();
@@ -1165,15 +1187,28 @@ namespace GTACoOp
                 }
                 catch (Exception ex)
                 {
-                    _crashCount++;
-                    WriteCrashLog(what, ex);
-                    if (Game.GameTime > _lastCrashNotify + 5000)
-                    {
-                        _lastCrashNotify = Game.GameTime;
-                        Notification.Show("~r~GTACoOp error~w~ in " + what + " (" + ex.GetType().Name + "). Logged to GTACoOp-crash.log");
-                    }
+                    ShowErrorNotice(what, ex);
                 }
             }
+        }
+
+        // Writes the crash log (if turned on) and shows a throttled notice. "Logged to" only appears when the log was actually written.
+        private static void ShowErrorNotice(string what, Exception ex)
+        {
+            _crashCount++;
+            bool logged = WriteCrashLog(what, ex);
+            if (Game.GameTime > _lastCrashNotify + 5000)
+            {
+                _lastCrashNotify = Game.GameTime;
+                Notification.Show("~r~GTACoOp error~w~ in " + what + " (" + ex.GetType().Name + ")." + (logged ? " Logged to GTACoOp-crash.log" : ""));
+            }
+        }
+
+        // Runs one step of a cleanup so a failure in it can't skip the steps after it
+        private static void SafeStep(string what, Action step)
+        {
+            try { step(); }
+            catch (Exception ex) { ShowErrorNotice(what, ex); }
         }
 
         private static string _lastSentChat;
@@ -1251,8 +1286,10 @@ namespace GTACoOp
             return false;
         }
 
-        private static void WriteCrashLog(string what, Exception ex)
+        // Returns true only if the crash log is turned on and the entry was written
+        private static bool WriteCrashLog(string what, Exception ex)
         {
+            bool logged = false;
             if (PlayerSettings != null && PlayerSettings.CrashLog)
             try
             {
@@ -1260,9 +1297,11 @@ namespace GTACoOp
                 File.AppendAllText(path,
                     "==== " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " | #" + _crashCount + " | message: " + what + Environment.NewLine +
                     ex.ToString() + Environment.NewLine + Environment.NewLine);
+                logged = true;
             }
             catch { }
             try { _logger?.WriteException("ProcessMessages " + what, ex); } catch { }
+            return logged;
         }
 
         private void HandleMessage(NetIncomingMessage msg)
@@ -1602,6 +1641,7 @@ namespace GTACoOp
                                 var data = (NativeTickCall)DeserializeBinary<NativeTickCall>(msg.ReadBytes(len));
                                 if (data == null) return;
                                 lock (_tickNatives) if (_tickNatives.ContainsKey(data.Identifier)) _tickNatives.Remove(data.Identifier);
+                                if (data.Identifier != null) _tickOnceDone.Remove(data.Identifier);
                             }
                             break;
                         case PacketType.NativeOnDisconnect:
@@ -1673,7 +1713,7 @@ namespace GTACoOp
 
                             break;
                         case NetConnectionStatus.Disconnected:
-                            var reason = msg.ReadString();
+                            var reason = msg.ReadString() ?? "";
                             Notification.Show("You have been disconnected" + (string.IsNullOrEmpty(reason) ? " from the server." : ": " + reason));
                             UpdateStatusText(null);
 
@@ -1681,45 +1721,58 @@ namespace GTACoOp
                             _waveInput.StopRecording();
 #endif
 
-                            lock (Opponents)
+                            // Every step runs on its own, so one failure can't skip the rest of the cleanup
+                            SafeStep("StatusChanged", () =>
                             {
-                                if (Opponents != null)
+                                lock (Opponents)
                                 {
-                                    Opponents.ToList().ForEach(pair => pair.Value.Clear());
-                                    Opponents.Clear();
+                                    if (Opponents != null)
+                                    {
+                                        Opponents.ToList().ForEach(pair => pair.Value?.Clear());
+                                        Opponents.Clear();
+                                    }
                                 }
-                            }
+                            });
 
-                            lock (Npcs)
+                            SafeStep("StatusChanged", () =>
                             {
-                                if (Npcs != null)
+                                lock (Npcs)
                                 {
-                                    Npcs.ToList().ForEach(pair => pair.Value.Clear());
-                                    Npcs.Clear();
+                                    if (Npcs != null)
+                                    {
+                                        Npcs.ToList().ForEach(pair => pair.Value?.Clear());
+                                        Npcs.Clear();
+                                    }
                                 }
-                            }
+                            });
 
+                            // Natives the server asked to run when you leave
+                            List<NativeData> dcNatives;
                             lock (_dcNatives)
-                                if (_dcNatives != null && _dcNatives.Any())
-                                {
-                                    _dcNatives.ToList().ForEach(pair => DecodeNativeCall(pair.Value));
-                                    _dcNatives.Clear();
-                                }
+                            {
+                                dcNatives = _dcNatives.Values.ToList();
+                                _dcNatives.Clear();
+                            }
+                            foreach (var dcNative in dcNatives)
+                                SafeStep("StatusChanged", () => DecodeNativeCall(dcNative));
 
                             lock (_tickNatives) if (_tickNatives != null) _tickNatives.Clear();
+                            _tickOnceDone.Clear();
 
-                            WorldCleanUp();
-
-                            //if (PlayerSettings.AutoReconnect && !reason.StartsWith("KICKED: ") && !reason.Equals("Connection closed by peer.") && !reason.Equals("Stopping Server") && !reason.Equals("Switching servers."))
-                            if (PlayerSettings.AutoConnect && (reason.Equals("Connection timed out") || reason.StartsWith("Could not connect to remote host:")))
-                            {
-                                ConnectToServer(_lastIP, _lastPort);
-                            }
+                            // Remove everything the server created (blips, checkpoints, vehicles, peds, props, pickups) and undo HUD/screen/GPS changes
+                            SafeStep("StatusChanged", WorldCleanUp);
+                            SafeStep("StatusChanged", RestoreServerState);
 
                             _blips = true;
 
                             // clear chat
-                            _chat.Reset();
+                            SafeStep("StatusChanged", () => _chat?.Reset());
+
+                            //if (PlayerSettings.AutoReconnect && !reason.StartsWith("KICKED: ") && !reason.Equals("Connection closed by peer.") && !reason.Equals("Stopping Server") && !reason.Equals("Switching servers."))
+                            if (PlayerSettings != null && PlayerSettings.AutoConnect && (reason.Equals("Connection timed out") || reason.StartsWith("Could not connect to remote host:")))
+                            {
+                                ConnectToServer(_lastIP, _lastPort);
+                            }
 
                             break;
                     }
@@ -1806,15 +1859,220 @@ namespace GTACoOp
 
         public void WorldCleanUp()
         {
+            int playerPed = 0, playerVeh = 0;
+            try
+            {
+                var me = Game.Player.Character;
+                if (me != null)
+                {
+                    playerPed = me.Handle;
+                    if (me.IsInVehicle() && me.CurrentVehicle != null) playerVeh = me.CurrentVehicle.Handle;
+                }
+            }
+            catch { }
+
             lock (_entityCleanup)
             {
-                _entityCleanup.ForEach(ent => Entity.FromHandle(ent).Delete());
+                foreach (var handle in _entityCleanup.Distinct().ToList())
+                {
+                    try
+                    {
+                        // Entity.FromHandle returns null for anything that's already gone (or a failed create that returned 0)
+                        var ent = handle == 0 ? null : Entity.FromHandle(handle);
+                        if (ent == null || !ent.Exists()) continue;
+                        if (handle == playerPed) continue;
+                        if (handle == playerVeh)
+                        {
+                            // Don't yank the car out from under you; let the game clean it up after you leave it
+                            ent.MarkAsNoLongerNeeded();
+                            continue;
+                        }
+                        ent.Delete();
+                    }
+                    catch { }
+                }
                 _entityCleanup.Clear();
             }
             lock (_blipCleanup)
             {
-                _blipCleanup.ForEach(blip => new Blip(blip).Delete());
+                foreach (var handle in _blipCleanup.Distinct().ToList())
+                {
+                    try
+                    {
+                        if (handle == 0) continue;
+                        var blip = new Blip(handle);
+                        if (blip.Exists()) blip.Delete();
+                    }
+                    catch { }
+                }
                 _blipCleanup.Clear();
+            }
+            lock (_checkpointCleanup)
+            {
+                foreach (var handle in _checkpointCleanup.Distinct().ToList())
+                {
+                    try { Function.Call(Hash.DELETE_CHECKPOINT, handle); } catch { }
+                }
+                _checkpointCleanup.Clear();
+            }
+            lock (_pickupCleanup)
+            {
+                foreach (var handle in _pickupCleanup.Distinct().ToList())
+                {
+                    try { if (Function.Call<bool>(Hash.DOES_PICKUP_EXIST, handle)) Function.Call(Hash.REMOVE_PICKUP, handle); } catch { }
+                }
+                _pickupCleanup.Clear();
+            }
+        }
+
+        // Undo HUD, radar, screen fade, screen effects, cameras, time scale, waypoint and GPS routes the server changed.
+        // Only things this server actually touched are reset, so your own settings and waypoints are left alone.
+        public void RestoreServerState()
+        {
+            HashSet<ulong> touched;
+            lock (_serverStateNatives)
+            {
+                touched = new HashSet<ulong>(_serverStateNatives);
+                _serverStateNatives.Clear();
+            }
+
+            if (touched.Contains((ulong)Hash.DISPLAY_HUD))
+                try { Function.Call(Hash.DISPLAY_HUD, true); } catch { }
+            if (touched.Contains((ulong)Hash.DISPLAY_RADAR))
+                try { Function.Call(Hash.DISPLAY_RADAR, true); } catch { }
+            if (touched.Contains((ulong)Hash.DO_SCREEN_FADE_OUT))
+                try
+                {
+                    if (Function.Call<bool>(Hash.IS_SCREEN_FADED_OUT) || Function.Call<bool>(Hash.IS_SCREEN_FADING_OUT))
+                        Function.Call(Hash.DO_SCREEN_FADE_IN, 500);
+                }
+                catch { }
+            if (touched.Contains((ulong)Hash.SET_TIMECYCLE_MODIFIER) || touched.Contains((ulong)Hash.SET_TRANSITION_TIMECYCLE_MODIFIER) || touched.Contains((ulong)Hash.PUSH_TIMECYCLE_MODIFIER))
+                try { Function.Call(Hash.CLEAR_TIMECYCLE_MODIFIER); } catch { }
+            if (touched.Contains((ulong)Hash.ANIMPOSTFX_PLAY))
+                try { Function.Call(Hash.ANIMPOSTFX_STOP_ALL); } catch { }
+            if (touched.Contains((ulong)Hash.SET_TIME_SCALE))
+                try { Function.Call(Hash.SET_TIME_SCALE, 1f); } catch { }
+
+            bool hadCams;
+            lock (_camCleanup) hadCams = _camCleanup.Count > 0;
+            if (touched.Contains((ulong)Hash.RENDER_SCRIPT_CAMS) || hadCams)
+                try { Function.Call(Hash.RENDER_SCRIPT_CAMS, false, false, 0, true, false, 0); } catch { }
+            lock (_camCleanup)
+            {
+                foreach (var cam in _camCleanup.Distinct().ToList())
+                    try { Function.Call(Hash.DESTROY_CAM, cam, false); } catch { }
+                _camCleanup.Clear();
+            }
+
+            if (touched.Contains((ulong)Hash.START_GPS_MULTI_ROUTE))
+                try { Function.Call(Hash.CLEAR_GPS_MULTI_ROUTE); } catch { }
+            if (touched.Contains((ulong)Hash.START_GPS_CUSTOM_ROUTE))
+                try { Function.Call(Hash.CLEAR_GPS_CUSTOM_ROUTE); } catch { }
+
+            // Only remove the waypoint if it's still the one the server set (within 10 m), not one you placed yourself
+            if (_serverWaypoint.HasValue)
+                try
+                {
+                    if (Game.IsWaypointActive)
+                    {
+                        var wp = World.WaypointPosition;
+                        var dx = wp.X - _serverWaypoint.Value.X;
+                        var dy = wp.Y - _serverWaypoint.Value.Y;
+                        if (dx * dx + dy * dy < 100f) World.RemoveWaypoint();
+                    }
+                }
+                catch { }
+            _serverWaypoint = null;
+        }
+
+        // Per-tick natives: screen effects and anything that creates something only run once per server update,
+        // and fades aren't restarted while already fading/faded, so they don't flicker or pile up every frame
+        private void RunTickNative(string id, NativeData native)
+        {
+            if (native == null) return;
+
+            if (native.Hash == (ulong)Hash.DO_SCREEN_FADE_OUT &&
+                (Function.Call<bool>(Hash.IS_SCREEN_FADED_OUT) || Function.Call<bool>(Hash.IS_SCREEN_FADING_OUT)))
+            {
+                lock (_serverStateNatives) _serverStateNatives.Add(native.Hash);
+                return;
+            }
+            if (native.Hash == (ulong)Hash.DO_SCREEN_FADE_IN &&
+                (Function.Call<bool>(Hash.IS_SCREEN_FADED_IN) || Function.Call<bool>(Hash.IS_SCREEN_FADING_IN)))
+                return;
+
+            if (IsRunOnceTickNative(native.Hash))
+            {
+                NativeData done;
+                if (id != null && _tickOnceDone.TryGetValue(id, out done) && ReferenceEquals(done, native)) return;
+                if (id != null) _tickOnceDone[id] = native;
+            }
+
+            DecodeNativeCall(native);
+        }
+
+        private bool IsRunOnceTickNative(ulong hash)
+        {
+            if (CheckNativeHash(hash) != NativeType.Unknown || GetTrackedHandleList(hash) != null) return true;
+            switch (hash)
+            {
+                case (ulong)Hash.ANIMPOSTFX_PLAY:
+                case (ulong)Hash.SET_TRANSITION_TIMECYCLE_MODIFIER:
+                case (ulong)Hash.PUSH_TIMECYCLE_MODIFIER:
+                case (ulong)Hash.SET_NEW_WAYPOINT:
+                case (ulong)Hash.START_GPS_MULTI_ROUTE:
+                case (ulong)Hash.START_GPS_CUSTOM_ROUTE:
+                    return true;
+            }
+            return false;
+        }
+
+        // Natives that create checkpoints, pickups or cameras, and the list their handles go in
+        private List<int> GetTrackedHandleList(ulong hash)
+        {
+            switch (hash)
+            {
+                case (ulong)Hash.CREATE_CHECKPOINT:
+                    return _checkpointCleanup;
+                case (ulong)Hash.CREATE_PICKUP:
+                case (ulong)Hash.CREATE_PICKUP_ROTATE:
+                    return _pickupCleanup;
+                case (ulong)Hash.CREATE_AMBIENT_PICKUP:
+                case (ulong)Hash.CREATE_PORTABLE_PICKUP:
+                    return _entityCleanup;
+                case (ulong)Hash.CREATE_CAM:
+                case (ulong)Hash.CREATE_CAM_WITH_PARAMS:
+                case (ulong)Hash.CREATE_CAMERA:
+                case (ulong)Hash.CREATE_CAMERA_WITH_PARAMS:
+                    return _camCleanup;
+            }
+            return null;
+        }
+
+        // Remember screen/HUD/GPS changes the server makes so they can be undone when you leave
+        private void RecordServerState(NativeData obj)
+        {
+            switch (obj.Hash)
+            {
+                case (ulong)Hash.DISPLAY_HUD:
+                case (ulong)Hash.DISPLAY_RADAR:
+                case (ulong)Hash.DO_SCREEN_FADE_OUT:
+                case (ulong)Hash.SET_TIMECYCLE_MODIFIER:
+                case (ulong)Hash.SET_TRANSITION_TIMECYCLE_MODIFIER:
+                case (ulong)Hash.PUSH_TIMECYCLE_MODIFIER:
+                case (ulong)Hash.ANIMPOSTFX_PLAY:
+                case (ulong)Hash.RENDER_SCRIPT_CAMS:
+                case (ulong)Hash.SET_TIME_SCALE:
+                case (ulong)Hash.START_GPS_MULTI_ROUTE:
+                case (ulong)Hash.START_GPS_CUSTOM_ROUTE:
+                    lock (_serverStateNatives) _serverStateNatives.Add(obj.Hash);
+                    break;
+                case (ulong)Hash.SET_NEW_WAYPOINT:
+                    var args = obj.Arguments;
+                    if (args != null && args.Count >= 2 && args[0] is FloatArgument && args[1] is FloatArgument)
+                        _serverWaypoint = new GTA.Math.Vector2(((FloatArgument)args[0]).Data, ((FloatArgument)args[1]).Data);
+                    break;
             }
         }
 
@@ -1938,6 +2196,10 @@ namespace GTACoOp
 
         public void DecodeNativeCall(NativeData obj)
         {
+            if (obj == null) return;
+            // protobuf leaves the list null when a native has no arguments (e.g. HIDE_HUD_AND_RADAR_THIS_FRAME)
+            if (obj.Arguments == null) obj.Arguments = new List<NativeArgument>();
+
             if(IsNativeBlocked(obj.Hash))
             {
                 SendNativeCallResponse(obj.Id, "Native execution of this native blocked by client");
@@ -2000,11 +2262,26 @@ namespace GTACoOp
                 }
             }
 
+            RecordServerState(obj);
+
+            // Checkpoints, pickups and cameras: keep the handle so they can be removed when you leave
+            var trackedList = GetTrackedHandleList(obj.Hash);
+            if (trackedList != null)
+            {
+                var handle = Function.Call<int>((Hash)obj.Hash, list.ToArray());
+                if (handle != 0 || trackedList == _checkpointCleanup) lock (trackedList) trackedList.Add(handle);
+                if (obj.ReturnType is IntArgument)
+                {
+                    SendNativeCallResponse(obj.Id, handle);
+                }
+                return;
+            }
+
             var nativeType = CheckNativeHash(obj.Hash);
 
             if ((int)nativeType >= 2)
             {
-                if ((int) nativeType >= 3)
+                if ((int) nativeType >= 3 && obj.Arguments.Count > (int) nativeType - 3)
                 {
                     var modelObj = obj.Arguments[(int) nativeType - 3];
                     int modelHash = 0;
@@ -2026,7 +2303,7 @@ namespace GTACoOp
                 }
 
                 var entId = Function.Call<int>((Hash) obj.Hash, list.ToArray());
-                lock(_entityCleanup) _entityCleanup.Add(entId);
+                if (entId != 0) lock(_entityCleanup) _entityCleanup.Add(entId);
                 if (obj.ReturnType is IntArgument)
                 {
                     SendNativeCallResponse(obj.Id, entId);
@@ -2037,7 +2314,7 @@ namespace GTACoOp
             if (nativeType == NativeType.ReturnsBlip)
             {
                 var blipId = Function.Call<int>((Hash)obj.Hash, list.ToArray());
-                lock (_blipCleanup) _blipCleanup.Add(blipId);
+                if (blipId != 0) lock (_blipCleanup) _blipCleanup.Add(blipId);
                 if (obj.ReturnType is IntArgument)
                 {
                     SendNativeCallResponse(obj.Id, blipId);
@@ -2114,6 +2391,7 @@ namespace GTACoOp
                 };
             }
 
+            if (_client == null) return;
             var msg = _client.CreateMessage();
             var bin = SerializeBinary(obj);
             msg.Write((int)PacketType.NativeResponse);
@@ -2142,6 +2420,7 @@ namespace GTACoOp
                 case 0x63C6CCA8E68AE8C8:
                     return NativeType.ReturnsEntity;
                 case 0x46818D79B1F7499A:
+                case 0xCE5D0E5E315DB238: // ADD_BLIP_FOR_AREA
                 case 0x5CDE92C702A8FCE7:
                 case 0xBE339365C863BD36:
                 case 0x5A039BB0BCA604B6:
